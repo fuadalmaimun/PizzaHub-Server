@@ -43,6 +43,13 @@ app.get("/menu-items", async (req, res) => {
   res.send(result);
 });
 
+app.get("/menu-items/:id", async (req, res) => {
+  const { id } = req.params;
+  const result = await menuItems.findOne({
+    _id: new ObjectId(id),
+  });
+  res.send(result);
+});
 
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
