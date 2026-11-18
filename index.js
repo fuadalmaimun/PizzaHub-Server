@@ -16,15 +16,15 @@ await client.connect();
 
 console.log("MongoDB Connected!");
 
-const db = client.db(process.env.DB_NAME);
 
+const db = client.db(process.env.DB_NAME);
 const menuItems = db.collection("menuItems");
 const users = db.collection("user");
 const sessions = db.collection("session");
 const orders = db.collection("orders");
-const transactions = db.collection("transactions");
 const favorites = db.collection("favorites");
 const reviews = db.collection("reviews");
+const transactions = db.collection("transactions");
 
 await Promise.all([
   favorites.createIndex({ customerId: 1, itemId: 1 }, { unique: true }),
