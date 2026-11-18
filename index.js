@@ -23,6 +23,16 @@ const users = db.collection("user");
 const sessions = db.collection("session");
 const orders = db.collection("orders");
 const transactions = db.collection("transactions");
+const favorites = db.collection("favorites");
+const reviews = db.collection("reviews");
+
+await Promise.all([
+  favorites.createIndex({ customerId: 1, itemId: 1 }, { unique: true }),
+  reviews.createIndex(
+    { targetType: 1, targetId: 1, customerId: 1 },
+    { unique: true },
+  ),
+]);
 
 // Email transporter
 const transporter = nodemailer.createTransport({
@@ -45,20 +55,15 @@ const sendEmail = async (to, subject, message) => {
   });
 };
 
-// Verify Token
-// Verify Token
+// লগইন করা ব্যবহারকারীর token যাচাই করে।
 const verifyToken = async (req, res, next) => {
   const token = req.headers.authorization?.split(" ")[1];
-
-  console.log("Received Token:", token);
 
   if (!token) {
     return res.status(401).send({ message: "Unauthorized" });
   }
 
   const sessionData = await sessions.findOne({ token });
-
-  console.log("Session Data:", sessionData);
 
   if (!sessionData) {
     return res.status(401).send({ message: "Invalid Token" });
@@ -99,12 +104,12 @@ const verifyAdmin = (req, res, next) => {
   next();
 };
 
-// Home
+// সার্ভার চালু আছে কি না পরীক্ষা করতে।
 app.get("/", (req, res) => {
   res.send("PizzaHub Server is Running!");
 });
 
-// Get All Approved Menu Items
+// গ্রাহকদের জন্য অনুমোদিত মেনু আইটেম দেখাতে।
 app.get("/menu-items", async (req, res) => {
   const result = await menuItems
     .find({
@@ -117,8 +122,12 @@ app.get("/menu-items", async (req, res) => {
   res.send(result);
 });
 
-// Get Single Menu Item
+// নির্দিষ্ট একটি অনুমোদিত মেনু আইটেমের বিস্তারিত দেখাতে।
 app.get("/menu-items/:id", async (req, res) => {
+  if (!ObjectId.isValid(req.params.id)) {
+    return res.status(400).send({ message: "Invalid Menu Item ID" });
+  }
+
   const result = await menuItems.findOne({
     _id: new ObjectId(req.params.id),
     status: "approved",
@@ -129,7 +138,213 @@ app.get("/menu-items/:id", async (req, res) => {
   res.send(result);
 });
 
-// Add Menu Item
+async function findReviewTarget(targetType, targetId) {
+  if (!ObjectId.isValid(targetId)) return null;
+
+  const objectId = new ObjectId(targetId);
+  if (targetType === "menuItem") {
+    const target = await menuItems.findOne({
+      _id: objectId,
+      status: "approved",
+      isAvailable: { $ne: false },
+      isActive: { $ne: false },
+    });
+    return target ? { target, collection: menuItems, objectId } : null;
+  }
+
+  if (targetType === "restaurant") {
+    const target = await users.findOne({ _id: objectId, role: "vendor" });
+    return target ? { target, collection: users, objectId } : null;
+  }
+
+  return null;
+}
+
+async function getReviewSummary(targetType, targetId) {
+  const [summary] = await reviews
+    .aggregate([
+      { $match: { targetType, targetId } },
+      {
+        $group: {
+          _id: null,
+          averageRating: { $avg: "$rating" },
+          reviewCount: { $sum: 1 },
+        },
+      },
+    ])
+    .toArray();
+
+  return {
+    averageRating: Number((summary?.averageRating ?? 0).toFixed(1)),
+    reviewCount: summary?.reviewCount ?? 0,
+  };
+}
+
+// কোনো মেনু আইটেম বা রেস্টুরেন্টের রিভিউ ও গড় rating দেখাতে।
+app.get("/reviews", async (req, res) => {
+  const { targetType, targetId } = req.query;
+  if (
+    typeof targetType !== "string" ||
+    typeof targetId !== "string" ||
+    !["menuItem", "restaurant"].includes(targetType)
+  ) {
+    return res.status(400).send({ message: "Invalid Review Target" });
+  }
+
+  const target = await findReviewTarget(targetType, targetId);
+  if (!target) {
+    return res.status(404).send({ message: "Review Target Not Found" });
+  }
+
+  const filter = { targetType, targetId };
+  const [reviewList, summary] = await Promise.all([
+    reviews.find(filter).sort({ createdAt: -1 }).toArray(),
+    getReviewSummary(targetType, targetId),
+  ]);
+
+  res.send({
+    reviews: reviewList,
+    ...summary,
+  });
+});
+
+// গ্রাহকের রিভিউ যোগ বা আপডেট করতে।
+app.post("/reviews", verifyToken, verifyCustomer, async (req, res) => {
+  const { targetType, targetId, rating, comment = "" } = req.body ?? {};
+  if (
+    typeof targetType !== "string" ||
+    !["menuItem", "restaurant"].includes(targetType) ||
+    typeof targetId !== "string" ||
+    !ObjectId.isValid(targetId)
+  ) {
+    return res.status(400).send({ message: "Invalid Review Target" });
+  }
+
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+    return res.status(400).send({ message: "Rating Must Be Between 1 and 5" });
+  }
+
+  if (typeof comment !== "string" || comment.trim().length > 1000) {
+    return res.status(400).send({ message: "Review Must Be 1000 Characters Or Less" });
+  }
+
+  const target = await findReviewTarget(targetType, targetId);
+  if (!target) {
+    return res.status(404).send({ message: "Review Target Not Found" });
+  }
+
+  const customerId = req.user._id.toString();
+  const now = new Date();
+  const reviewFilter = { targetType, targetId, customerId };
+  await reviews.updateOne(
+    reviewFilter,
+    {
+      $set: {
+        rating,
+        comment: comment.trim(),
+        customerName: req.user.name,
+        updatedAt: now,
+      },
+      $setOnInsert: { createdAt: now },
+    },
+    { upsert: true },
+  );
+
+  const { averageRating, reviewCount } = await getReviewSummary(
+    targetType,
+    targetId,
+  );
+
+  await target.collection.updateOne(
+    { _id: target.objectId },
+    { $set: { rating: averageRating, reviewCount } },
+  );
+
+  const review = await reviews.findOne(reviewFilter);
+  res.send({ review, averageRating, reviewCount });
+});
+
+// গ্রাহকের পছন্দের চালু মেনু আইটেমগুলো দেখাতে।
+app.get("/customer/favorites", verifyToken, verifyCustomer, async (req, res) => {
+  const savedFavorites = await favorites
+    .find({ customerId: req.user._id.toString() })
+    .sort({ createdAt: -1 })
+    .toArray();
+  const itemIds = savedFavorites
+    .map((favorite) => favorite.itemId)
+    .filter((itemId) => ObjectId.isValid(itemId))
+    .map((itemId) => new ObjectId(itemId));
+
+  if (itemIds.length === 0) return res.send([]);
+
+  const availableItems = await menuItems
+    .find({
+      _id: { $in: itemIds },
+      status: "approved",
+      isAvailable: { $ne: false },
+      isActive: { $ne: false },
+    })
+    .toArray();
+  const itemsById = new Map(
+    availableItems.map((item) => [item._id.toString(), item]),
+  );
+  res.send(
+    savedFavorites
+      .map((favorite) => itemsById.get(favorite.itemId))
+      .filter(Boolean),
+  );
+});
+
+// একটি মেনু আইটেম গ্রাহকের পছন্দের তালিকায় যোগ করতে।
+app.post("/customer/favorites", verifyToken, verifyCustomer, async (req, res) => {
+  const { itemId } = req.body ?? {};
+  if (typeof itemId !== "string" || !ObjectId.isValid(itemId)) {
+    return res.status(400).send({ message: "Invalid Menu Item ID" });
+  }
+
+  const menuItem = await menuItems.findOne({
+    _id: new ObjectId(itemId),
+    status: "approved",
+    isAvailable: { $ne: false },
+    isActive: { $ne: false },
+  });
+  if (!menuItem) {
+    return res.status(404).send({ message: "Menu Item Not Found" });
+  }
+
+  await favorites.updateOne(
+    { customerId: req.user._id.toString(), itemId },
+    {
+      $setOnInsert: {
+        customerId: req.user._id.toString(),
+        itemId,
+        createdAt: new Date(),
+      },
+    },
+    { upsert: true },
+  );
+  res.send({ message: "Menu Item Added To Favorites" });
+});
+
+// পছন্দের তালিকা থেকে একটি মেনু আইটেম সরাতে।
+app.delete(
+  "/customer/favorites/:itemId",
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    if (!ObjectId.isValid(req.params.itemId)) {
+      return res.status(400).send({ message: "Invalid Menu Item ID" });
+    }
+
+    await favorites.deleteOne({
+      customerId: req.user._id.toString(),
+      itemId: req.params.itemId,
+    });
+    res.send({ message: "Menu Item Removed From Favorites" });
+  },
+);
+
+// বিক্রেতার নতুন মেনু আইটেম অনুমোদনের জন্য জমা দিতে।
 app.post("/menu-items", verifyToken, verifyVendor, async (req, res) => {
   const pizzaData = {
     ...req.body,
@@ -142,7 +357,7 @@ app.post("/menu-items", verifyToken, verifyVendor, async (req, res) => {
   res.send(result);
 });
 
-// Get Vendor Menu Items
+// বিক্রেতার নিজের সব মেনু আইটেম দেখাতে।
 app.get("/vendor/menu-items", verifyToken, verifyVendor, async (req, res) => {
   const result = await menuItems
     .find({
@@ -153,7 +368,7 @@ app.get("/vendor/menu-items", verifyToken, verifyVendor, async (req, res) => {
   res.send(result);
 });
 
-// Update Menu Item
+// বিক্রেতার নিজের মেনু আইটেম সম্পাদনা করতে।
 app.patch("/menu-items/:id", verifyToken, verifyVendor, async (req, res) => {
   const { vendorId, status, ...data } = req.body;
 
@@ -168,7 +383,7 @@ app.patch("/menu-items/:id", verifyToken, verifyVendor, async (req, res) => {
   res.send(result);
 });
 
-// Delete Menu Item
+// বিক্রেতার নিজের মেনু আইটেম মুছতে।
 app.delete("/menu-items/:id", verifyToken, verifyVendor, async (req, res) => {
   const result = await menuItems.deleteOne({
     _id: new ObjectId(req.params.id),
@@ -178,7 +393,7 @@ app.delete("/menu-items/:id", verifyToken, verifyVendor, async (req, res) => {
   res.send(result);
 });
 
-// Get Vendor Orders
+// বিক্রেতার পাওয়া অর্ডারগুলো দেখাতে।
 app.get("/vendor/orders", verifyToken, verifyVendor, async (req, res) => {
   const result = await orders
     .find({
@@ -190,12 +405,16 @@ app.get("/vendor/orders", verifyToken, verifyVendor, async (req, res) => {
   res.send(result);
 });
 
-// Vendor Accept / Reject Order
+// বিক্রেতাকে অর্ডার গ্রহণ বা বাতিল করতে।
 app.patch("/vendor/orders/:id", verifyToken, verifyVendor, async (req, res) => {
   const { status } = req.body;
 
   if (!["accepted", "rejected"].includes(status)) {
     return res.status(400).send({ message: "Invalid Status" });
+  }
+
+  if (!ObjectId.isValid(req.params.id)) {
+    return res.status(400).send({ message: "Invalid Order ID" });
   }
 
   const order = await orders.findOne({
@@ -208,7 +427,23 @@ app.patch("/vendor/orders/:id", verifyToken, verifyVendor, async (req, res) => {
     return res.status(404).send({ message: "Order Not Found" });
   }
 
-  await orders.updateOne({ _id: order._id }, { $set: { status } });
+  const changedAt = new Date();
+  const result = await orders.updateOne(
+    { _id: order._id, vendorId: req.user._id.toString(), status: "pending" },
+    {
+      $set: { status, updatedAt: changedAt },
+      $push: {
+        statusHistory: {
+          status,
+          changedAt,
+          actorRole: "vendor",
+        },
+      },
+    },
+  );
+  if (result.modifiedCount === 0) {
+    return res.status(409).send({ message: "Order Status Has Already Changed" });
+  }
 
   const customer = await users.findOne({
     _id: new ObjectId(order.customerId),
@@ -231,7 +466,7 @@ app.patch("/vendor/orders/:id", verifyToken, verifyVendor, async (req, res) => {
   res.send({ message: "Order Updated Successfully" });
 });
 
-// Vendor Dashboard Overview
+// বিক্রেতার dashboard-এর সংক্ষিপ্ত হিসাব দেখাতে।
 app.get("/vendor/overview", verifyToken, verifyVendor, async (req, res) => {
   const vendorId = req.user._id.toString();
 
@@ -257,7 +492,7 @@ app.get("/vendor/overview", verifyToken, verifyVendor, async (req, res) => {
   });
 });
 
-// Customer Dashboard Overview
+// গ্রাহকের dashboard-এর অর্ডার হিসাব দেখাতে।
 app.get("/customer/overview", verifyToken, verifyCustomer, async (req, res) => {
   const customerId = req.user._id.toString();
 
@@ -283,7 +518,7 @@ app.get("/customer/overview", verifyToken, verifyCustomer, async (req, res) => {
   });
 });
 
-// Get Customer Orders
+// গ্রাহকের নিজের সব অর্ডার দেখাতে।
 app.get("/customer/orders", verifyToken, verifyCustomer, async (req, res) => {
   const result = await orders
     .find({
@@ -295,7 +530,7 @@ app.get("/customer/orders", verifyToken, verifyCustomer, async (req, res) => {
   res.send(result);
 });
 
-// Place Customer Order
+// গ্রাহককে একটি মেনু আইটেম অর্ডার করতে।
 app.post("/orders", verifyToken, verifyCustomer, async (req, res) => {
   const { itemId, deliveryDate, deliveryAddress, message } = req.body;
 
@@ -333,6 +568,7 @@ app.post("/orders", verifyToken, verifyCustomer, async (req, res) => {
   }
 
   // Save Order
+  const createdAt = new Date();
   const order = {
     itemId: menuItem._id.toString(),
     vendorId,
@@ -346,7 +582,14 @@ app.post("/orders", verifyToken, verifyCustomer, async (req, res) => {
     deliveryAddress: deliveryAddress.trim(),
     message: message || "",
     status: "pending",
-    createdAt: new Date(),
+    statusHistory: [
+      {
+        status: "pending",
+        changedAt: createdAt,
+        actorRole: "customer",
+      },
+    ],
+    createdAt,
   };
 
   const result = await orders.insertOne(order);
@@ -398,13 +641,14 @@ const cancelOrder = async (req, res) => {
   res.send({ message: "Order Cancelled Successfully" });
 };
 
-// Customer Cancel API
+// গ্রাহকের অপেক্ষমাণ অর্ডার বাতিল করতে (PATCH পদ্ধতি)।
 app.patch("/customer/orders/:id", verifyToken, verifyCustomer, cancelOrder);
+// একই অর্ডার বাতিলের জন্য DELETE পদ্ধতিটিও সমর্থন করতে।
 app.delete("/customer/orders/:id", verifyToken, verifyCustomer, cancelOrder);
 
 
 
-// Admin Overview
+// admin-কে সাইটের মোট ব্যবহারকারী, মেনু ও লেনদেন দেখাতে।
 app.get("/admin/overview", verifyToken, verifyAdmin, async (req, res) => {
   const totalUsers = await users.countDocuments();
   const totalVendors = await users.countDocuments({ role: "vendor" });
@@ -425,7 +669,7 @@ app.get("/admin/overview", verifyToken, verifyAdmin, async (req, res) => {
   });
 });
 
-// Admin Get All Users
+// admin-কে ব্যবহারকারী খুঁজতে ও role অনুযায়ী তালিকা দেখাতে।
 app.get("/admin/users", verifyToken, verifyAdmin, async (req, res) => {
   const search = req.query.search || "";
   const role = req.query.role || "";
@@ -456,7 +700,7 @@ app.get("/admin/users", verifyToken, verifyAdmin, async (req, res) => {
   res.send(result);
 });
 
-// Admin Block / Unblock User
+// admin-কে ব্যবহারকারীর প্রবেশাধিকার বন্ধ বা চালু করতে।
 app.patch("/admin/users/:id", verifyToken, verifyAdmin, async (req, res) => {
   const { isBlocked } = req.body;
 
@@ -480,7 +724,7 @@ app.patch("/admin/users/:id", verifyToken, verifyAdmin, async (req, res) => {
   res.send({ message: "User Status Updated Successfully" });
 });
 
-// Admin Get All Menu Items
+// admin-কে মেনু আইটেম খুঁজতে ও status অনুযায়ী তালিকা দেখাতে।
 app.get("/admin/menu-items", verifyToken, verifyAdmin, async (req, res) => {
   const search = req.query.search || "";
   const status = req.query.status || "";
@@ -502,7 +746,7 @@ app.get("/admin/menu-items", verifyToken, verifyAdmin, async (req, res) => {
   res.send(result);
 });
 
-// Admin Approve / Reject Menu Item
+// admin-কে মেনু আইটেম অনুমোদন বা প্রত্যাখ্যান করতে।
 app.patch("/admin/menu-items/:id", verifyToken, verifyAdmin, async (req, res) => {
   const { status } = req.body;
 
@@ -526,7 +770,7 @@ app.patch("/admin/menu-items/:id", verifyToken, verifyAdmin, async (req, res) =>
   res.send({ message: "Menu Item Status Updated Successfully" });
 });
 
-// Admin Delete Menu Item
+// admin-কে কোনো মেনু আইটেম মুছতে।
 app.delete("/admin/menu-items/:id", verifyToken, verifyAdmin, async (req, res) => {
   if (!ObjectId.isValid(req.params.id)) {
     return res.status(400).send({ message: "Invalid Menu Item ID" });
@@ -543,7 +787,7 @@ app.delete("/admin/menu-items/:id", verifyToken, verifyAdmin, async (req, res) =
   res.send({ message: "Menu Item Deleted Successfully" });
 });
 
-// Admin Get All Transactions
+// admin-কে সব লেনদেনের তালিকা দেখাতে।
 app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
   const result = await transactions
     .find({})
