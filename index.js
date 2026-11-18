@@ -34,10 +34,13 @@ const transporter = nodemailer.createTransport({
 // Send Email
 const sendEmail = async (to, subject, message) => {
   await transporter.sendMail({
-    from: process.env.EMAIL_USER,
-    to: to,
-    subject: subject,
-    text: message,
+    from: {
+      name: "Pizza Hub",
+      address: process.env.EMAIL_USER,
+    },
+    to,
+    subject,
+    html: message,
   });
 };
 
@@ -180,18 +183,35 @@ app.patch("/vendor/orders/:id", verifyToken, verifyVendor, async (req, res) => {
     return res.status(400).send({ message: "Invalid Status" });
   }
 
-  const result = await orders.updateOne(
-    {
-      _id: new ObjectId(req.params.id),
-      vendorId: req.user._id.toString(),
-      status: "pending",
-    },
-    { $set: { status } },
-  );
+  const order = await orders.findOne({
+    _id: new ObjectId(req.params.id),
+    vendorId: req.user._id.toString(),
+    status: "pending",
+  });
 
-  if (result.matchedCount === 0) {
+  if (!order) {
     return res.status(404).send({ message: "Order Not Found" });
   }
+
+  await orders.updateOne({ _id: order._id }, { $set: { status } });
+
+  const customer = await users.findOne({
+    _id: new ObjectId(order.customerId),
+  });
+
+  // Send Email to Customer
+  await sendEmail(
+    customer.email,
+    `Your Order ${status}`,
+    `
+      <h2>PizzaHub Order Update</h2>
+      <img src="${order.itemImage}" width="250" />
+      <h3>${order.itemName}</h3>
+      <p>Price: ৳${order.itemPrice}</p>
+      <p>Status: ${status}</p>
+      <p>Your order has been ${status} by the vendor.</p>
+    `,
+  );
 
   res.send({ message: "Order Updated Successfully" });
 });
@@ -318,8 +338,26 @@ app.post("/orders", verifyToken, verifyCustomer, async (req, res) => {
 
   await sendEmail(
     vendor.email,
-    "New Pizza Order",
-    `You received a new order for ${order.itemName}`,
+    "New Pizza Order - PizzaHub",
+    `
+    <h2>New Pizza Order!</h2>
+
+    <img
+      src="${order.itemImage}"
+      alt="${order.itemName}"
+      width="250"
+      style="border-radius: 10px;"
+    />
+
+    <h3>${order.itemName}</h3>
+    <p>Category: ${menuItem.category}</p>
+    <p>Price: ৳${order.itemPrice}</p>
+    <p>Customer: ${req.user.name}</p>
+    <p>Delivery Date: ${order.deliveryDate}</p>
+    <p>Address: ${order.deliveryAddress}</p>
+    <p>Message: ${order.message || "No message"}</p>
+    <p>Order ID: ${result.insertedId}</p>
+  `,
   );
 
   res.status(201).send({
