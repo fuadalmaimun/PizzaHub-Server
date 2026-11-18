@@ -12,9 +12,6 @@ const port = process.env.PORT || 5000;
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 app.use(cors());
-
-// Stripe Webhook
-// IMPORTANT: this route must stay before app.use(express.json()) because
 // Stripe needs the raw request body to verify the signature.
 app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (req, res) => {
   const sig = req.headers["stripe-signature"];
@@ -34,35 +31,36 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
   }
 
   try {
+    // 1) First payment: the vendor finished Stripe Checkout and the
+    //    yearly subscription started.
     if (event.type === "checkout.session.completed") {
-      const payment = event.data.object;
-      const vendorId = payment.metadata?.vendorId;
+      const session = event.data.object;
 
-      // Only unlock Premium after a real, paid checkout.
-      if (payment.payment_status === "paid" && vendorId) {
-        // 2) Never upgrade twice for the same checkout session.
-        const alreadySaved = await transactions.findOne({
-          stripeSessionId: payment.id,
-        });
-
-        if (!alreadySaved) {
-          // MongoDB ids are ObjectId, but Stripe metadata is a string.
-          await users.updateOne(
-            { _id: new ObjectId(vendorId) },
-            { $set: { subscriptionPlan: "premium" } }
-          );
-
-          await transactions.insertOne({
-            vendorId: new ObjectId(vendorId),
-            plan: "premium",
-            amount: 10,
-            currency: "usd",
-            status: "paid",
-            stripeSessionId: payment.id,
-            createdAt: new Date(),
-          });
-        }
+      if (session.mode === "subscription" && isPaidCheckout(session)) {
+        await activatePremium(session);
       }
+    }
+
+    // 2) Renewal: Stripe charged the saved card again after one year.
+    if (event.type === "invoice.paid") {
+      const invoice = event.data.object;
+
+      if (
+        invoice.billing_reason === "subscription_cycle" &&
+        invoice.status === "paid"
+      ) {
+        await handleInvoiceRenewal(invoice);
+      }
+    }
+
+    // 3) Plan updated (for example "cancel at period end" was turned on).
+    if (event.type === "customer.subscription.updated") {
+      await syncSubscription(event.data.object);
+    }
+
+    // 4) Subscription cancelled/ended: back to the Free plan.
+    if (event.type === "customer.subscription.deleted") {
+      await endSubscription(event.data.object);
     }
 
     // Stripe expects a 200 so it does not retry the event.
@@ -91,6 +89,188 @@ const orders = db.collection("orders");
 const favorites = db.collection("favorites");
 const reviews = db.collection("reviews");
 const transactions = db.collection("transactions");
+
+// ---------------------------------------------------------------------------
+// Premium subscription helpers
+// Premium is a $10/year Stripe subscription. These helpers are shared by the
+// webhook and by the success page's verify endpoint.
+// ---------------------------------------------------------------------------
+
+const PREMIUM_YEARLY_PRICE = 10; // dollars
+
+// Stripe stores the end of the paid period on the subscription item.
+function getPeriodEnd(subscription) {
+  const seconds =
+    subscription?.items?.data?.[0]?.current_period_end ??
+    subscription?.current_period_end;
+
+  return seconds ? new Date(seconds * 1000) : null;
+}
+
+// A subscription checkout is finished once Stripe has the first payment.
+function isPaidCheckout(session) {
+  return (
+    session.payment_status === "paid" ||
+    session.payment_status === "no_payment_required"
+  );
+}
+
+// Finds which vendor a Stripe subscription belongs to.
+async function findVendorId(subscription, checkoutVendorId) {
+  const candidates = [checkoutVendorId, subscription?.metadata?.vendorId];
+
+  for (const id of candidates) {
+    if (id && ObjectId.isValid(id)) {
+      return new ObjectId(id);
+    }
+  }
+
+  // Fallback for renewals whose metadata is missing.
+  const vendor = await users.findOne({ stripeSubscriptionId: subscription?.id });
+  return vendor?._id ?? null;
+}
+
+// Saves a payment only once. Renewals are matched by invoice id, the first
+// payment by checkout session id.
+async function saveTransaction(transaction) {
+  const filter = transaction.stripeInvoiceId
+    ? { stripeInvoiceId: transaction.stripeInvoiceId }
+    : { stripeSessionId: transaction.stripeSessionId };
+
+  const existing = await transactions.findOne(filter);
+  if (existing) return existing;
+
+  const document = { ...transaction, createdAt: new Date() };
+  const result = await transactions.insertOne(document);
+
+  return { _id: result.insertedId, ...document };
+}
+
+// Unlocks Premium and stores the Stripe subscription details on the vendor.
+async function setPremium(vendorId, subscription) {
+  const customerId =
+    typeof subscription?.customer === "string"
+      ? subscription.customer
+      : subscription?.customer?.id;
+
+  await users.updateOne(
+    { _id: vendorId },
+    {
+      $set: {
+        subscriptionPlan: "premium",
+        subscriptionStatus: subscription?.status ?? "active",
+        subscriptionExpiresAt: getPeriodEnd(subscription),
+        cancelAtPeriodEnd: Boolean(subscription?.cancel_at_period_end),
+        stripeCustomerId: customerId ?? null,
+        stripeSubscriptionId: subscription?.id ?? null,
+      },
+    },
+  );
+}
+
+// Downgrades the vendor (subscription cancelled or expired).
+async function setFree(vendorId, status) {
+  await users.updateOne(
+    { _id: vendorId },
+    {
+      $set: {
+        subscriptionPlan: "free",
+        subscriptionStatus: status,
+        cancelAtPeriodEnd: false,
+      },
+    },
+  );
+}
+
+// First payment: the vendor just finished Stripe Checkout.
+// Called by the webhook AND by the success page, so it saves only once.
+async function activatePremium(session) {
+  const subscriptionId =
+    typeof session.subscription === "string"
+      ? session.subscription
+      : session.subscription?.id;
+
+  if (!subscriptionId) return null;
+
+  const alreadySaved = await transactions.findOne({
+    stripeSessionId: session.id,
+  });
+  if (alreadySaved) return alreadySaved;
+
+  // Use the expanded subscription when Stripe already sent it.
+  const subscription =
+    typeof session.subscription === "object" && session.subscription
+      ? session.subscription
+      : await stripe.subscriptions.retrieve(subscriptionId);
+
+  const vendorId = await findVendorId(subscription, session.metadata?.vendorId);
+  if (!vendorId) return null;
+
+  await setPremium(vendorId, subscription);
+
+  return saveTransaction({
+    vendorId,
+    plan: "premium",
+    kind: "subscription",
+    amount: (session.amount_total ?? PREMIUM_YEARLY_PRICE * 100) / 100,
+    currency: session.currency ?? "usd",
+    status: "paid",
+    stripeSessionId: session.id,
+    stripeSubscriptionId: subscription.id,
+    periodEnd: getPeriodEnd(subscription),
+  });
+}
+
+// Renewal: Stripe charged the saved card again after one year.
+async function handleInvoiceRenewal(invoice) {
+  const subscriptionRef =
+    invoice.parent?.subscription_details?.subscription ?? invoice.subscription;
+
+  if (!subscriptionRef) return null;
+
+  const subscription =
+    typeof subscriptionRef === "object"
+      ? subscriptionRef
+      : await stripe.subscriptions.retrieve(subscriptionRef);
+
+  const vendorId = await findVendorId(subscription);
+  if (!vendorId) return null;
+
+  // New period end = the next renewal date.
+  await setPremium(vendorId, subscription);
+
+  return saveTransaction({
+    vendorId,
+    plan: "premium",
+    kind: "renewal",
+    amount: (invoice.amount_paid ?? 0) / 100,
+    currency: invoice.currency ?? "usd",
+    status: invoice.status ?? "paid",
+    stripeInvoiceId: invoice.id,
+    stripeSubscriptionId: subscription.id,
+    periodEnd: getPeriodEnd(subscription),
+  });
+}
+
+// Subscription updated: keep plan and dates in sync.
+async function syncSubscription(subscription) {
+  const vendorId = await findVendorId(subscription);
+  if (!vendorId) return;
+
+  if (subscription.status === "active" || subscription.status === "trialing") {
+    await setPremium(vendorId, subscription);
+  } else {
+    await setFree(vendorId, subscription.status ?? "canceled");
+  }
+}
+
+// Subscription deleted/cancelled: Premium ends.
+async function endSubscription(subscription) {
+  const vendorId = await findVendorId(subscription);
+  if (!vendorId) return;
+
+  await setFree(vendorId, "canceled");
+}
 
 await Promise.all([
   favorites.createIndex({ customerId: 1, itemId: 1 }, { unique: true }),
@@ -141,6 +321,21 @@ const verifyToken = async (req, res, next) => {
     return res.status(403).send({ message: "Access Denied" });
   }
 
+  // A yearly subscription that was not renewed goes back to Free.
+  if (
+    user.subscriptionPlan === "premium" &&
+    user.subscriptionExpiresAt &&
+    new Date(user.subscriptionExpiresAt).getTime() < Date.now()
+  ) {
+    await users.updateOne(
+      { _id: user._id },
+      { $set: { subscriptionPlan: "free", subscriptionStatus: "expired" } },
+    );
+
+    user.subscriptionPlan = "free";
+    user.subscriptionStatus = "expired";
+  }
+
   req.user = user;
   next();
 };
@@ -170,25 +365,33 @@ const verifyAdmin = (req, res, next) => {
   next();
 };
 
-// Create Premium Payment Session
+// Create Premium Subscription Session ($10 per year)
 app.post("/vendor/create-checkout-session", verifyToken, verifyVendor, async (req, res) => {
+  const priceId = process.env.STRIPE_YEARLY_PRICE_ID;
+
+  if (!priceId) {
+    return res
+      .status(500)
+      .send({ message: "The yearly Premium price is not configured." });
+  }
+
+  if (req.user.subscriptionPlan === "premium") {
+    return res.status(400).send({ message: "You already have Premium." });
+  }
+
   try {
+    const vendorId = req.user._id.toString();
+
     const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      line_items: [
-        {
-          price_data: {
-            currency: "usd",
-            product_data: { name: "PizzaHub Premium" },
-            unit_amount: 1000,
-          },
-          quantity: 1,
-        },
-      ],
-      metadata: {
-        vendorId: req.user._id.toString(),
-      },
-      success_url: `${process.env.CLIENT_URL}/payment/success`,
+      // Recurring payment: Stripe charges the vendor $10 every year.
+      mode: "subscription",
+      line_items: [{ price: priceId, quantity: 1 }],
+      metadata: { vendorId },
+      // Renewal invoices carry the vendor id too, so webhooks can find the vendor.
+      subscription_data: { metadata: { vendorId } },
+      // Pre-fills the email input on Stripe Checkout with the vendor's email.
+      customer_email: req.user.email,
+      success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
     });
 
@@ -200,9 +403,108 @@ app.post("/vendor/create-checkout-session", verifyToken, verifyVendor, async (re
 });
 
 // Vendor's own subscription plan (used by the Subscription page + payment success page).
-// Premium itself is only set by the verified Stripe webhook above.
+// Premium itself is only set after Stripe confirms the subscription payment.
 app.get("/vendor/subscription", verifyToken, verifyVendor, async (req, res) => {
-  res.send({ subscriptionPlan: req.user.subscriptionPlan ?? "free" });
+  res.send({
+    subscriptionPlan:
+      req.user.subscriptionPlan === "premium" ? "premium" : "free",
+    subscriptionStatus: req.user.subscriptionStatus ?? null,
+    subscriptionExpiresAt: req.user.subscriptionExpiresAt ?? null,
+    cancelAtPeriodEnd: Boolean(req.user.cancelAtPeriodEnd),
+  });
+});
+
+// Cancel (or resume) the yearly renewal. Access stays until the paid period ends.
+app.post("/vendor/cancel-subscription", verifyToken, verifyVendor, async (req, res) => {
+  if (!req.user.stripeSubscriptionId) {
+    return res
+      .status(400)
+      .send({ message: "You do not have a Premium subscription." });
+  }
+
+  // Default action is "cancel at period end"; send { cancel: false } to resume.
+  const cancel = req.body?.cancel !== false;
+
+  try {
+    const subscription = await stripe.subscriptions.update(
+      req.user.stripeSubscriptionId,
+      { cancel_at_period_end: cancel },
+    );
+
+    await syncSubscription(subscription);
+
+    res.send({
+      cancelAtPeriodEnd: Boolean(subscription.cancel_at_period_end),
+      subscriptionExpiresAt: getPeriodEnd(subscription),
+    });
+  } catch (error) {
+    console.error("Subscription cancellation failed:", error);
+    res
+      .status(500)
+      .send({ message: "Could not update your subscription. Please try again." });
+  }
+});
+
+// Success page calls this so a delayed/missing webhook never hides a real payment.
+// The session is verified directly with Stripe using the secret key (server only).
+app.post("/vendor/verify-payment", verifyToken, verifyVendor, async (req, res) => {
+  const sessionId = req.body?.sessionId;
+
+  if (!sessionId || typeof sessionId !== "string") {
+    return res.status(400).send({ message: "A checkout session id is required." });
+  }
+
+  try {
+    // Expand the subscription so we can read the renewal date.
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ["subscription"],
+    });
+
+    if (session.metadata?.vendorId !== req.user._id.toString()) {
+      return res.status(403).send({ message: "This payment does not belong to you." });
+    }
+
+    if (!isPaidCheckout(session)) {
+      return res.status(400).send({ message: "Payment is not completed yet." });
+    }
+
+    if (session.mode !== "subscription" || !session.subscription) {
+      return res
+        .status(400)
+        .send({ message: "This checkout is not a Premium subscription." });
+    }
+
+    await activatePremium(session);
+    res.send({ verified: true });
+  } catch (error) {
+    console.error("Payment verification failed:", error);
+    res.status(500).send({ message: "Could not verify the payment." });
+  }
+});
+
+// Vendor payment history (newest first).
+app.get("/vendor/transactions", verifyToken, verifyVendor, async (req, res) => {
+  const result = await transactions
+    .find({ vendorId: req.user._id })
+    .sort({ createdAt: -1 })
+    .limit(20)
+    .toArray();
+
+  res.send(result);
+});
+
+// One transaction by Stripe checkout session id (must belong to this vendor).
+app.get("/vendor/transactions/:sessionId", verifyToken, verifyVendor, async (req, res) => {
+  const transaction = await transactions.findOne({
+    stripeSessionId: req.params.sessionId,
+    vendorId: req.user._id,
+  });
+
+  if (!transaction) {
+    return res.status(404).send({ message: "Payment is not saved yet." });
+  }
+
+  res.send(transaction);
 });
 
 // সার্ভার চালু আছে কি না পরীক্ষা করতে।
