@@ -3,11 +3,77 @@ import cors from "cors";
 import "dotenv/config";
 import { MongoClient, ObjectId } from "mongodb";
 import nodemailer from "nodemailer";
+import Stripe from "stripe";
 
 const app = express();
 const port = process.env.PORT || 5000;
 
+// Initialize Stripe
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
 app.use(cors());
+
+// Stripe Webhook
+// IMPORTANT: this route must stay before app.use(express.json()) because
+// Stripe needs the raw request body to verify the signature.
+app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+
+  let event;
+
+  // 1) Verify that the request really came from Stripe.
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (error) {
+    console.error("Stripe webhook signature verification failed:", error.message);
+    return res.status(400).send({ message: "Invalid Stripe signature" });
+  }
+
+  try {
+    if (event.type === "checkout.session.completed") {
+      const payment = event.data.object;
+      const vendorId = payment.metadata?.vendorId;
+
+      // Only unlock Premium after a real, paid checkout.
+      if (payment.payment_status === "paid" && vendorId) {
+        // 2) Never upgrade twice for the same checkout session.
+        const alreadySaved = await transactions.findOne({
+          stripeSessionId: payment.id,
+        });
+
+        if (!alreadySaved) {
+          // MongoDB ids are ObjectId, but Stripe metadata is a string.
+          await users.updateOne(
+            { _id: new ObjectId(vendorId) },
+            { $set: { subscriptionPlan: "premium" } }
+          );
+
+          await transactions.insertOne({
+            vendorId: new ObjectId(vendorId),
+            plan: "premium",
+            amount: 10,
+            currency: "usd",
+            status: "paid",
+            stripeSessionId: payment.id,
+            createdAt: new Date(),
+          });
+        }
+      }
+    }
+
+    // Stripe expects a 200 so it does not retry the event.
+    res.send({ received: true });
+  } catch (error) {
+    console.error("Stripe webhook handling failed:", error);
+    // Non-2xx makes Stripe retry later, which is what we want on a real failure.
+    res.status(500).send({ message: "Webhook handling failed" });
+  }
+});
+
 app.use(express.json());
 
 // MongoDB Connection
@@ -103,6 +169,41 @@ const verifyAdmin = (req, res, next) => {
 
   next();
 };
+
+// Create Premium Payment Session
+app.post("/vendor/create-checkout-session", verifyToken, verifyVendor, async (req, res) => {
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: { name: "PizzaHub Premium" },
+            unit_amount: 1000,
+          },
+          quantity: 1,
+        },
+      ],
+      metadata: {
+        vendorId: req.user._id.toString(),
+      },
+      success_url: `${process.env.CLIENT_URL}/payment/success`,
+      cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
+    });
+
+    res.send({ url: session.url });
+  } catch (error) {
+    console.error("Stripe checkout session failed:", error);
+    res.status(500).send({ message: "Could not start the payment. Please try again." });
+  }
+});
+
+// Vendor's own subscription plan (used by the Subscription page + payment success page).
+// Premium itself is only set by the verified Stripe webhook above.
+app.get("/vendor/subscription", verifyToken, verifyVendor, async (req, res) => {
+  res.send({ subscriptionPlan: req.user.subscriptionPlan ?? "free" });
+});
 
 // সার্ভার চালু আছে কি না পরীক্ষা করতে।
 app.get("/", (req, res) => {
