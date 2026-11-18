@@ -22,6 +22,7 @@ const menuItems = db.collection("menuItems");
 const users = db.collection("user");
 const sessions = db.collection("session");
 const orders = db.collection("orders");
+const transactions = db.collection("transactions");
 
 // Email transporter
 const transporter = nodemailer.createTransport({
@@ -45,14 +46,19 @@ const sendEmail = async (to, subject, message) => {
 };
 
 // Verify Token
+// Verify Token
 const verifyToken = async (req, res, next) => {
   const token = req.headers.authorization?.split(" ")[1];
+
+  console.log("Received Token:", token);
 
   if (!token) {
     return res.status(401).send({ message: "Unauthorized" });
   }
 
   const sessionData = await sessions.findOne({ token });
+
+  console.log("Session Data:", sessionData);
 
   if (!sessionData) {
     return res.status(401).send({ message: "Invalid Token" });
@@ -81,6 +87,15 @@ const verifyCustomer = (req, res, next) => {
   if (req.user.role !== "customer") {
     return res.status(403).send({ message: "Customer Only" });
   }
+  next();
+};
+
+// Verify Admin
+const verifyAdmin = (req, res, next) => {
+  if (req.user.role !== "admin") {
+    return res.status(403).send({ message: "Access Denied" });
+  }
+
   next();
 };
 
@@ -386,6 +401,157 @@ const cancelOrder = async (req, res) => {
 // Customer Cancel API
 app.patch("/customer/orders/:id", verifyToken, verifyCustomer, cancelOrder);
 app.delete("/customer/orders/:id", verifyToken, verifyCustomer, cancelOrder);
+
+
+
+// Admin Overview
+app.get("/admin/overview", verifyToken, verifyAdmin, async (req, res) => {
+  const totalUsers = await users.countDocuments();
+  const totalVendors = await users.countDocuments({ role: "vendor" });
+  const totalCustomers = await users.countDocuments({ role: "customer" });
+  const totalMenuItems = await menuItems.countDocuments();
+  const pendingMenuItems = await menuItems.countDocuments({
+    status: "pending",
+  });
+  const totalTransactions = await transactions.countDocuments();
+
+  res.send({
+    totalUsers,
+    totalVendors,
+    totalCustomers,
+    totalMenuItems,
+    pendingMenuItems,
+    totalTransactions,
+  });
+});
+
+// Admin Get All Users
+app.get("/admin/users", verifyToken, verifyAdmin, async (req, res) => {
+  const search = req.query.search || "";
+  const role = req.query.role || "";
+
+  const filter = {};
+
+  // Search by Name or Email
+  if (search) {
+    filter.$or = [
+      { name: { $regex: search, $options: "i" } },
+      { email: { $regex: search, $options: "i" } },
+    ];
+  }
+
+  // Filter by Role
+  if (role) {
+    filter.role = role;
+  }
+
+  const result = await users
+    .find(filter, {
+      projection: {
+        password: 0,
+      },
+    })
+    .toArray();
+
+  res.send(result);
+});
+
+// Admin Block / Unblock User
+app.patch("/admin/users/:id", verifyToken, verifyAdmin, async (req, res) => {
+  const { isBlocked } = req.body;
+
+  if (typeof isBlocked !== "boolean") {
+    return res.status(400).send({ message: "Invalid Block Status" });
+  }
+
+  if (!ObjectId.isValid(req.params.id)) {
+    return res.status(400).send({ message: "Invalid User ID" });
+  }
+
+  const result = await users.updateOne(
+    { _id: new ObjectId(req.params.id) },
+    { $set: { isBlocked } },
+  );
+
+  if (result.matchedCount === 0) {
+    return res.status(404).send({ message: "User Not Found" });
+  }
+
+  res.send({ message: "User Status Updated Successfully" });
+});
+
+// Admin Get All Menu Items
+app.get("/admin/menu-items", verifyToken, verifyAdmin, async (req, res) => {
+  const search = req.query.search || "";
+  const status = req.query.status || "";
+
+  const filter = {};
+
+  // Search by Item Name
+  if (search) {
+    filter.itemName = { $regex: search, $options: "i" };
+  }
+
+  // Filter by Status
+  if (status) {
+    filter.status = status;
+  }
+
+  const result = await menuItems.find(filter).toArray();
+
+  res.send(result);
+});
+
+// Admin Approve / Reject Menu Item
+app.patch("/admin/menu-items/:id", verifyToken, verifyAdmin, async (req, res) => {
+  const { status } = req.body;
+
+  if (!["approved", "rejected"].includes(status)) {
+    return res.status(400).send({ message: "Invalid Status" });
+  }
+
+  if (!ObjectId.isValid(req.params.id)) {
+    return res.status(400).send({ message: "Invalid Menu Item ID" });
+  }
+
+  const result = await menuItems.updateOne(
+    { _id: new ObjectId(req.params.id) },
+    { $set: { status } },
+  );
+
+  if (result.matchedCount === 0) {
+    return res.status(404).send({ message: "Menu Item Not Found" });
+  }
+
+  res.send({ message: "Menu Item Status Updated Successfully" });
+});
+
+// Admin Delete Menu Item
+app.delete("/admin/menu-items/:id", verifyToken, verifyAdmin, async (req, res) => {
+  if (!ObjectId.isValid(req.params.id)) {
+    return res.status(400).send({ message: "Invalid Menu Item ID" });
+  }
+
+  const result = await menuItems.deleteOne({
+    _id: new ObjectId(req.params.id),
+  });
+
+  if (result.deletedCount === 0) {
+    return res.status(404).send({ message: "Menu Item Not Found" });
+  }
+
+  res.send({ message: "Menu Item Deleted Successfully" });
+});
+
+// Admin Get All Transactions
+app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
+  const result = await transactions
+    .find({})
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  res.send(result);
+});
 
 // Start Server
 app.listen(port, () => {
