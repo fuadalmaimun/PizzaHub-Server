@@ -1190,11 +1190,35 @@ app.delete("/admin/menu-items/:id", verifyToken, verifyAdmin, async (req, res) =
   res.send({ message: "Menu Item Deleted Successfully" });
 });
 
-// admin-কে সব লেনদেনের তালিকা দেখাতে।
+// admin-কে সব লেনদেনের তালিকা vendor তথ্য সহ দেখাতে।
 app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
   const result = await transactions
-    .find({})
-    .sort({ createdAt: -1 })
+    .aggregate([
+      { $sort: { createdAt: -1 } },
+      // Each transaction stores the vendor id, so join the vendor document.
+      {
+        $lookup: {
+          from: "user",
+          localField: "vendorId",
+          foreignField: "_id",
+          as: "vendor",
+        },
+      },
+      {
+        $unwind: {
+          path: "$vendor",
+          preserveNullAndEmptyArrays: true,
+        },
+      },
+      // Never send password / private auth fields to the browser.
+      {
+        $project: {
+          "vendor.password": 0,
+          "vendor.accounts": 0,
+          "vendor.sessions": 0,
+        },
+      },
+    ])
     .toArray();
 
   res.send(result);
