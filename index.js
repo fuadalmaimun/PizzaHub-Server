@@ -91,6 +91,74 @@ const reviews = db.collection("reviews");
 const transactions = db.collection("transactions");
 
 // ---------------------------------------------------------------------------
+// Vendor plan limits
+// Free vendors can keep at most 3 active items. Premium is unlimited.
+// "Active" means the same thing the vendor dashboard shows: the item is not
+// inactive, not switched off and not marked unavailable.
+// ---------------------------------------------------------------------------
+
+const FREE_ACTIVE_ITEM_LIMIT = 3;
+
+function isPremiumVendor(user) {
+  return user?.subscriptionPlan === "premium";
+}
+
+function isActiveItem(item) {
+  return (
+    item.status !== "inactive" &&
+    item.isAvailable !== false &&
+    item.isActive !== false
+  );
+}
+
+async function countActiveItems(vendorId) {
+  return menuItems.countDocuments({
+    vendorId,
+    status: { $ne: "inactive" },
+    isAvailable: { $ne: false },
+    isActive: { $ne: false },
+  });
+}
+
+// Same answer for create and for activating an older item.
+function freePlanLimitMessage() {
+  return `Your Free plan allows ${FREE_ACTIVE_ITEM_LIMIT} active menu items. Upgrade to Premium for unlimited items.`;
+}
+
+// Public menu items are shown together with their vendor so the site can show
+// the Premium badge and put Premium vendors first.
+async function attachVendors(items) {
+  const vendorIds = [
+    ...new Set(items.map((item) => item.vendorId).filter(Boolean)),
+  ];
+  if (vendorIds.length === 0) return items;
+
+  const vendorObjectIds = vendorIds
+    .filter((id) => ObjectId.isValid(id))
+    .map((id) => new ObjectId(id));
+
+  const vendorDocs = await users
+    .find({ _id: { $in: vendorObjectIds } })
+    .project({
+      name: 1,
+      businessName: 1,
+      subscriptionPlan: 1,
+      image: 1,
+      location: 1,
+    })
+    .toArray();
+
+  const vendorById = new Map(
+    vendorDocs.map((vendor) => [vendor._id.toString(), vendor]),
+  );
+
+  return items.map((item) => ({
+    ...item,
+    vendor: vendorById.get(String(item.vendorId)) ?? null,
+  }));
+}
+
+// ---------------------------------------------------------------------------
 // Premium subscription helpers
 // Premium is a $10/year Stripe subscription. These helpers are shared by the
 // webhook and by the success page's verify endpoint.
@@ -522,7 +590,7 @@ app.get("/menu-items", async (req, res) => {
     })
     .toArray();
 
-  res.send(result);
+  res.send(await attachVendors(result));
 });
 
 // নির্দিষ্ট একটি অনুমোদিত মেনু আইটেমের বিস্তারিত দেখাতে।
@@ -538,7 +606,10 @@ app.get("/menu-items/:id", async (req, res) => {
     isActive: { $ne: false },
   });
 
-  res.send(result);
+  if (!result) return res.send(result);
+
+  const [itemWithVendor] = await attachVendors([result]);
+  res.send(itemWithVendor);
 });
 
 async function findReviewTarget(targetType, targetId) {
@@ -749,9 +820,22 @@ app.delete(
 
 // বিক্রেতার নতুন মেনু আইটেম অনুমোদনের জন্য জমা দিতে।
 app.post("/menu-items", verifyToken, verifyVendor, async (req, res) => {
+  const vendorId = req.user._id.toString();
+
+  // Free vendors stop at 3 active items.
+  if (!isPremiumVendor(req.user)) {
+    const activeCount = await countActiveItems(vendorId);
+    if (activeCount >= FREE_ACTIVE_ITEM_LIMIT) {
+      return res.status(403).send({
+        code: "FREE_PLAN_LIMIT",
+        message: freePlanLimitMessage(),
+      });
+    }
+  }
+
   const pizzaData = {
     ...req.body,
-    vendorId: req.user._id.toString(),
+    vendorId,
     status: "pending",
     createdAt: new Date(),
   };
@@ -774,6 +858,31 @@ app.get("/vendor/menu-items", verifyToken, verifyVendor, async (req, res) => {
 // বিক্রেতার নিজের মেনু আইটেম সম্পাদনা করতে।
 app.patch("/menu-items/:id", verifyToken, verifyVendor, async (req, res) => {
   const { vendorId, status, ...data } = req.body;
+
+  if (!ObjectId.isValid(req.params.id)) {
+    return res.status(400).send({ message: "Invalid Menu Item ID" });
+  }
+
+  const existing = await menuItems.findOne({
+    _id: new ObjectId(req.params.id),
+    vendorId: req.user._id.toString(),
+  });
+
+  if (!existing) {
+    return res.status(404).send({ message: "Menu Item Not Found" });
+  }
+
+  // Activating an item counts against the Free plan limit too.
+  const willBeActive = isActiveItem({ ...existing, ...data });
+  if (!isPremiumVendor(req.user) && willBeActive && !isActiveItem(existing)) {
+    const activeCount = await countActiveItems(req.user._id.toString());
+    if (activeCount >= FREE_ACTIVE_ITEM_LIMIT) {
+      return res.status(403).send({
+        code: "FREE_PLAN_LIMIT",
+        message: freePlanLimitMessage(),
+      });
+    }
+  }
 
   const result = await menuItems.updateOne(
     {
@@ -1103,28 +1212,68 @@ app.get("/admin/users", verifyToken, verifyAdmin, async (req, res) => {
   res.send(result);
 });
 
-// admin-কে ব্যবহারকারীর প্রবেশাধিকার বন্ধ বা চালু করতে।
-app.patch("/admin/users/:id", verifyToken, verifyAdmin, async (req, res) => {
-  const { isBlocked } = req.body;
+// admin-কে ব্যবহারকারীর role বদলাতে বা প্রবেশাধিকার বন্ধ/চালু করতে।
+const ASSIGNABLE_ROLES = ["admin", "vendor", "customer"];
 
-  if (typeof isBlocked !== "boolean") {
-    return res.status(400).send({ message: "Invalid Block Status" });
-  }
+app.patch("/admin/users/:id", verifyToken, verifyAdmin, async (req, res) => {
+  const { isBlocked, role } = req.body ?? {};
 
   if (!ObjectId.isValid(req.params.id)) {
     return res.status(400).send({ message: "Invalid User ID" });
   }
 
-  const result = await users.updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $set: { isBlocked } },
-  );
+  const update = {};
 
-  if (result.matchedCount === 0) {
+  if (isBlocked !== undefined) {
+    if (typeof isBlocked !== "boolean") {
+      return res.status(400).send({ message: "Invalid Block Status" });
+    }
+    update.isBlocked = isBlocked;
+  }
+
+  if (role !== undefined) {
+    if (!ASSIGNABLE_ROLES.includes(role)) {
+      return res.status(400).send({ message: "Invalid Role" });
+    }
+
+    // An admin must not lock themselves out of the admin dashboard.
+    if (
+      req.params.id === req.user._id.toString() &&
+      role !== "admin"
+    ) {
+      return res
+        .status(400)
+        .send({ message: "You cannot change your own admin role." });
+    }
+
+    update.role = role;
+  }
+
+  if (Object.keys(update).length === 0) {
+    return res.status(400).send({ message: "Nothing To Update" });
+  }
+
+  const targetUser = await users.findOne({ _id: new ObjectId(req.params.id) });
+  if (!targetUser) {
     return res.status(404).send({ message: "User Not Found" });
   }
 
-  res.send({ message: "User Status Updated Successfully" });
+  // A new vendor needs a storefront name and a subscription plan.
+  if (update.role === "vendor") {
+    if (!targetUser.businessName) update.businessName = targetUser.name;
+    if (!targetUser.subscriptionPlan) update.subscriptionPlan = "free";
+  }
+
+  await users.updateOne(
+    { _id: new ObjectId(req.params.id) },
+    { $set: update },
+  );
+
+  res.send({
+    message: "User Updated Successfully",
+    role: update.role ?? targetUser.role,
+    isBlocked: update.isBlocked ?? Boolean(targetUser.isBlocked),
+  });
 });
 
 // admin-কে মেনু আইটেম খুঁজতে ও status অনুযায়ী তালিকা দেখাতে।
