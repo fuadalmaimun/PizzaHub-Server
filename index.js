@@ -12,65 +12,73 @@ const port = process.env.PORT || 5000;
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 app.use(cors());
+
 // Stripe needs the raw request body to verify the signature.
-app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (req, res) => {
-  const sig = req.headers["stripe-signature"];
+app.post(
+  "/stripe-webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
 
-  let event;
+    let event;
 
-  // 1) Verify that the request really came from Stripe.
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (error) {
-    console.error("Stripe webhook signature verification failed:", error.message);
-    return res.status(400).send({ message: "Invalid Stripe signature" });
-  }
+    // 1) Verify that the request really came from Stripe.
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET,
+      );
+    } catch (error) {
+      console.error(
+        "Stripe webhook signature verification failed:",
+        error.message,
+      );
+      return res.status(400).send({ message: "Invalid Stripe signature" });
+    }
 
-  try {
-    // 1) First payment: the vendor finished Stripe Checkout and the
-    //    yearly subscription started.
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
+    try {
+      // 1) First payment: the vendor finished Stripe Checkout and the
+      //    yearly subscription started.
+      if (event.type === "checkout.session.completed") {
+        const session = event.data.object;
 
-      if (session.mode === "subscription" && isPaidCheckout(session)) {
-        await activatePremium(session);
+        if (session.mode === "subscription" && isPaidCheckout(session)) {
+          await activatePremium(session);
+        }
       }
-    }
 
-    // 2) Renewal: Stripe charged the saved card again after one year.
-    if (event.type === "invoice.paid") {
-      const invoice = event.data.object;
+      // 2) Renewal: Stripe charged the saved card again after one year.
+      if (event.type === "invoice.paid") {
+        const invoice = event.data.object;
 
-      if (
-        invoice.billing_reason === "subscription_cycle" &&
-        invoice.status === "paid"
-      ) {
-        await handleInvoiceRenewal(invoice);
+        if (
+          invoice.billing_reason === "subscription_cycle" &&
+          invoice.status === "paid"
+        ) {
+          await handleInvoiceRenewal(invoice);
+        }
       }
-    }
 
-    // 3) Plan updated (for example "cancel at period end" was turned on).
-    if (event.type === "customer.subscription.updated") {
-      await syncSubscription(event.data.object);
-    }
+      // 3) Plan updated (for example "cancel at period end" was turned on).
+      if (event.type === "customer.subscription.updated") {
+        await syncSubscription(event.data.object);
+      }
 
-    // 4) Subscription cancelled/ended: back to the Free plan.
-    if (event.type === "customer.subscription.deleted") {
-      await endSubscription(event.data.object);
-    }
+      // 4) Subscription cancelled/ended: back to the Free plan.
+      if (event.type === "customer.subscription.deleted") {
+        await endSubscription(event.data.object);
+      }
 
-    // Stripe expects a 200 so it does not retry the event.
-    res.send({ received: true });
-  } catch (error) {
-    console.error("Stripe webhook handling failed:", error);
-    // Non-2xx makes Stripe retry later, which is what we want on a real failure.
-    res.status(500).send({ message: "Webhook handling failed" });
-  }
-});
+      // Stripe expects a 200 so it does not retry the event.
+      res.send({ received: true });
+    } catch (error) {
+      console.error("Stripe webhook handling failed:", error);
+      // Non-2xx makes Stripe retry later, which is what we want on a real failure.
+      res.status(500).send({ message: "Webhook handling failed" });
+    }
+  },
+);
 
 app.use(express.json());
 
@@ -79,7 +87,6 @@ const client = new MongoClient(process.env.MONGODB_URI);
 await client.connect();
 
 console.log("MongoDB Connected!");
-
 
 const db = client.db(process.env.DB_NAME);
 const menuItems = db.collection("menuItems");
@@ -96,6 +103,7 @@ const transactions = db.collection("transactions");
 // "Active" means the same thing the vendor dashboard shows: the item is not
 // inactive, not switched off and not marked unavailable.
 // ---------------------------------------------------------------------------
+
 
 const FREE_ACTIVE_ITEM_LIMIT = 3;
 
@@ -194,7 +202,9 @@ async function findVendorId(subscription, checkoutVendorId) {
   }
 
   // Fallback for renewals whose metadata is missing.
-  const vendor = await users.findOne({ stripeSubscriptionId: subscription?.id });
+  const vendor = await users.findOne({
+    stripeSubscriptionId: subscription?.id,
+  });
   return vendor?._id ?? null;
 }
 
@@ -434,41 +444,48 @@ const verifyAdmin = (req, res, next) => {
 };
 
 // Create Premium Subscription Session ($10 per year)
-app.post("/vendor/create-checkout-session", verifyToken, verifyVendor, async (req, res) => {
-  const priceId = process.env.STRIPE_YEARLY_PRICE_ID;
+app.post(
+  "/vendor/create-checkout-session",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    const priceId = process.env.STRIPE_YEARLY_PRICE_ID;
 
-  if (!priceId) {
-    return res
-      .status(500)
-      .send({ message: "The yearly Premium price is not configured." });
-  }
+    if (!priceId) {
+      return res
+        .status(500)
+        .send({ message: "The yearly Premium price is not configured." });
+    }
 
-  if (req.user.subscriptionPlan === "premium") {
-    return res.status(400).send({ message: "You already have Premium." });
-  }
+    if (req.user.subscriptionPlan === "premium") {
+      return res.status(400).send({ message: "You already have Premium." });
+    }
 
-  try {
-    const vendorId = req.user._id.toString();
+    try {
+      const vendorId = req.user._id.toString();
 
-    const session = await stripe.checkout.sessions.create({
-      // Recurring payment: Stripe charges the vendor $10 every year.
-      mode: "subscription",
-      line_items: [{ price: priceId, quantity: 1 }],
-      metadata: { vendorId },
-      // Renewal invoices carry the vendor id too, so webhooks can find the vendor.
-      subscription_data: { metadata: { vendorId } },
-      // Pre-fills the email input on Stripe Checkout with the vendor's email.
-      customer_email: req.user.email,
-      success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
-    });
+      const session = await stripe.checkout.sessions.create({
+        // Recurring payment: Stripe charges the vendor $10 every year.
+        mode: "subscription",
+        line_items: [{ price: priceId, quantity: 1 }],
+        metadata: { vendorId },
+        // Renewal invoices carry the vendor id too, so webhooks can find the vendor.
+        subscription_data: { metadata: { vendorId } },
+        // Pre-fills the email input on Stripe Checkout with the vendor's email.
+        customer_email: req.user.email,
+        success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
+      });
 
-    res.send({ url: session.url });
-  } catch (error) {
-    console.error("Stripe checkout session failed:", error);
-    res.status(500).send({ message: "Could not start the payment. Please try again." });
-  }
-});
+      res.send({ url: session.url });
+    } catch (error) {
+      console.error("Stripe checkout session failed:", error);
+      res
+        .status(500)
+        .send({ message: "Could not start the payment. Please try again." });
+    }
+  },
+);
 
 // Vendor's own subscription plan (used by the Subscription page + payment success page).
 // Premium itself is only set after Stripe confirms the subscription payment.
@@ -483,72 +500,88 @@ app.get("/vendor/subscription", verifyToken, verifyVendor, async (req, res) => {
 });
 
 // Cancel (or resume) the yearly renewal. Access stays until the paid period ends.
-app.post("/vendor/cancel-subscription", verifyToken, verifyVendor, async (req, res) => {
-  if (!req.user.stripeSubscriptionId) {
-    return res
-      .status(400)
-      .send({ message: "You do not have a Premium subscription." });
-  }
+app.post(
+  "/vendor/cancel-subscription",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    if (!req.user.stripeSubscriptionId) {
+      return res
+        .status(400)
+        .send({ message: "You do not have a Premium subscription." });
+    }
 
-  // Default action is "cancel at period end"; send { cancel: false } to resume.
-  const cancel = req.body?.cancel !== false;
+    // Default action is "cancel at period end"; send { cancel: false } to resume.
+    const cancel = req.body?.cancel !== false;
 
-  try {
-    const subscription = await stripe.subscriptions.update(
-      req.user.stripeSubscriptionId,
-      { cancel_at_period_end: cancel },
-    );
+    try {
+      const subscription = await stripe.subscriptions.update(
+        req.user.stripeSubscriptionId,
+        { cancel_at_period_end: cancel },
+      );
 
-    await syncSubscription(subscription);
+      await syncSubscription(subscription);
 
-    res.send({
-      cancelAtPeriodEnd: Boolean(subscription.cancel_at_period_end),
-      subscriptionExpiresAt: getPeriodEnd(subscription),
-    });
-  } catch (error) {
-    console.error("Subscription cancellation failed:", error);
-    res
-      .status(500)
-      .send({ message: "Could not update your subscription. Please try again." });
-  }
-});
+      res.send({
+        cancelAtPeriodEnd: Boolean(subscription.cancel_at_period_end),
+        subscriptionExpiresAt: getPeriodEnd(subscription),
+      });
+    } catch (error) {
+      console.error("Subscription cancellation failed:", error);
+      res.status(500).send({
+        message: "Could not update your subscription. Please try again.",
+      });
+    }
+  },
+);
 
 // Success page calls this so a delayed/missing webhook never hides a real payment.
 // The session is verified directly with Stripe using the secret key (server only).
-app.post("/vendor/verify-payment", verifyToken, verifyVendor, async (req, res) => {
-  const sessionId = req.body?.sessionId;
+app.post(
+  "/vendor/verify-payment",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    const sessionId = req.body?.sessionId;
 
-  if (!sessionId || typeof sessionId !== "string") {
-    return res.status(400).send({ message: "A checkout session id is required." });
-  }
-
-  try {
-    // Expand the subscription so we can read the renewal date.
-    const session = await stripe.checkout.sessions.retrieve(sessionId, {
-      expand: ["subscription"],
-    });
-
-    if (session.metadata?.vendorId !== req.user._id.toString()) {
-      return res.status(403).send({ message: "This payment does not belong to you." });
-    }
-
-    if (!isPaidCheckout(session)) {
-      return res.status(400).send({ message: "Payment is not completed yet." });
-    }
-
-    if (session.mode !== "subscription" || !session.subscription) {
+    if (!sessionId || typeof sessionId !== "string") {
       return res
         .status(400)
-        .send({ message: "This checkout is not a Premium subscription." });
+        .send({ message: "A checkout session id is required." });
     }
 
-    await activatePremium(session);
-    res.send({ verified: true });
-  } catch (error) {
-    console.error("Payment verification failed:", error);
-    res.status(500).send({ message: "Could not verify the payment." });
-  }
-});
+    try {
+      // Expand the subscription so we can read the renewal date.
+      const session = await stripe.checkout.sessions.retrieve(sessionId, {
+        expand: ["subscription"],
+      });
+
+      if (session.metadata?.vendorId !== req.user._id.toString()) {
+        return res
+          .status(403)
+          .send({ message: "This payment does not belong to you." });
+      }
+
+      if (!isPaidCheckout(session)) {
+        return res
+          .status(400)
+          .send({ message: "Payment is not completed yet." });
+      }
+
+      if (session.mode !== "subscription" || !session.subscription) {
+        return res
+          .status(400)
+          .send({ message: "This checkout is not a Premium subscription." });
+      }
+
+      await activatePremium(session);
+      res.send({ verified: true });
+    } catch (error) {
+      console.error("Payment verification failed:", error);
+      res.status(500).send({ message: "Could not verify the payment." });
+    }
+  },
+);
 
 // Vendor payment history (newest first).
 app.get("/vendor/transactions", verifyToken, verifyVendor, async (req, res) => {
@@ -562,18 +595,23 @@ app.get("/vendor/transactions", verifyToken, verifyVendor, async (req, res) => {
 });
 
 // One transaction by Stripe checkout session id (must belong to this vendor).
-app.get("/vendor/transactions/:sessionId", verifyToken, verifyVendor, async (req, res) => {
-  const transaction = await transactions.findOne({
-    stripeSessionId: req.params.sessionId,
-    vendorId: req.user._id,
-  });
+app.get(
+  "/vendor/transactions/:sessionId",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    const transaction = await transactions.findOne({
+      stripeSessionId: req.params.sessionId,
+      vendorId: req.user._id,
+    });
 
-  if (!transaction) {
-    return res.status(404).send({ message: "Payment is not saved yet." });
-  }
+    if (!transaction) {
+      return res.status(404).send({ message: "Payment is not saved yet." });
+    }
 
-  res.send(transaction);
-});
+    res.send(transaction);
+  },
+);
 
 // সার্ভার চালু আছে কি না পরীক্ষা করতে।
 app.get("/", (req, res) => {
@@ -699,7 +737,9 @@ app.post("/reviews", verifyToken, verifyCustomer, async (req, res) => {
   }
 
   if (typeof comment !== "string" || comment.trim().length > 1000) {
-    return res.status(400).send({ message: "Review Must Be 1000 Characters Or Less" });
+    return res
+      .status(400)
+      .send({ message: "Review Must Be 1000 Characters Or Less" });
   }
 
   const target = await findReviewTarget(targetType, targetId);
@@ -739,66 +779,76 @@ app.post("/reviews", verifyToken, verifyCustomer, async (req, res) => {
 });
 
 // গ্রাহকের পছন্দের চালু মেনু আইটেমগুলো দেখাতে।
-app.get("/customer/favorites", verifyToken, verifyCustomer, async (req, res) => {
-  const savedFavorites = await favorites
-    .find({ customerId: req.user._id.toString() })
-    .sort({ createdAt: -1 })
-    .toArray();
-  const itemIds = savedFavorites
-    .map((favorite) => favorite.itemId)
-    .filter((itemId) => ObjectId.isValid(itemId))
-    .map((itemId) => new ObjectId(itemId));
+app.get(
+  "/customer/favorites",
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    const savedFavorites = await favorites
+      .find({ customerId: req.user._id.toString() })
+      .sort({ createdAt: -1 })
+      .toArray();
+    const itemIds = savedFavorites
+      .map((favorite) => favorite.itemId)
+      .filter((itemId) => ObjectId.isValid(itemId))
+      .map((itemId) => new ObjectId(itemId));
 
-  if (itemIds.length === 0) return res.send([]);
+    if (itemIds.length === 0) return res.send([]);
 
-  const availableItems = await menuItems
-    .find({
-      _id: { $in: itemIds },
+    const availableItems = await menuItems
+      .find({
+        _id: { $in: itemIds },
+        status: "approved",
+        isAvailable: { $ne: false },
+        isActive: { $ne: false },
+      })
+      .toArray();
+    const itemsById = new Map(
+      availableItems.map((item) => [item._id.toString(), item]),
+    );
+    res.send(
+      savedFavorites
+        .map((favorite) => itemsById.get(favorite.itemId))
+        .filter(Boolean),
+    );
+  },
+);
+
+// একটি মেনু আইটেম গ্রাহকের পছন্দের তালিকায় যোগ করতে।
+app.post(
+  "/customer/favorites",
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    const { itemId } = req.body ?? {};
+    if (typeof itemId !== "string" || !ObjectId.isValid(itemId)) {
+      return res.status(400).send({ message: "Invalid Menu Item ID" });
+    }
+
+    const menuItem = await menuItems.findOne({
+      _id: new ObjectId(itemId),
       status: "approved",
       isAvailable: { $ne: false },
       isActive: { $ne: false },
-    })
-    .toArray();
-  const itemsById = new Map(
-    availableItems.map((item) => [item._id.toString(), item]),
-  );
-  res.send(
-    savedFavorites
-      .map((favorite) => itemsById.get(favorite.itemId))
-      .filter(Boolean),
-  );
-});
+    });
+    if (!menuItem) {
+      return res.status(404).send({ message: "Menu Item Not Found" });
+    }
 
-// একটি মেনু আইটেম গ্রাহকের পছন্দের তালিকায় যোগ করতে।
-app.post("/customer/favorites", verifyToken, verifyCustomer, async (req, res) => {
-  const { itemId } = req.body ?? {};
-  if (typeof itemId !== "string" || !ObjectId.isValid(itemId)) {
-    return res.status(400).send({ message: "Invalid Menu Item ID" });
-  }
-
-  const menuItem = await menuItems.findOne({
-    _id: new ObjectId(itemId),
-    status: "approved",
-    isAvailable: { $ne: false },
-    isActive: { $ne: false },
-  });
-  if (!menuItem) {
-    return res.status(404).send({ message: "Menu Item Not Found" });
-  }
-
-  await favorites.updateOne(
-    { customerId: req.user._id.toString(), itemId },
-    {
-      $setOnInsert: {
-        customerId: req.user._id.toString(),
-        itemId,
-        createdAt: new Date(),
+    await favorites.updateOne(
+      { customerId: req.user._id.toString(), itemId },
+      {
+        $setOnInsert: {
+          customerId: req.user._id.toString(),
+          itemId,
+          createdAt: new Date(),
+        },
       },
-    },
-    { upsert: true },
-  );
-  res.send({ message: "Menu Item Added To Favorites" });
-});
+      { upsert: true },
+    );
+    res.send({ message: "Menu Item Added To Favorites" });
+  },
+);
 
 // পছন্দের তালিকা থেকে একটি মেনু আইটেম সরাতে।
 app.delete(
@@ -954,7 +1004,9 @@ app.patch("/vendor/orders/:id", verifyToken, verifyVendor, async (req, res) => {
     },
   );
   if (result.modifiedCount === 0) {
-    return res.status(409).send({ message: "Order Status Has Already Changed" });
+    return res
+      .status(409)
+      .send({ message: "Order Status Has Already Changed" });
   }
 
   const customer = await users.findOne({
@@ -1158,8 +1210,6 @@ app.patch("/customer/orders/:id", verifyToken, verifyCustomer, cancelOrder);
 // একই অর্ডার বাতিলের জন্য DELETE পদ্ধতিটিও সমর্থন করতে।
 app.delete("/customer/orders/:id", verifyToken, verifyCustomer, cancelOrder);
 
-
-
 // admin-কে সাইটের মোট ব্যবহারকারী, মেনু ও লেনদেন দেখাতে।
 app.get("/admin/overview", verifyToken, verifyAdmin, async (req, res) => {
   const totalUsers = await users.countDocuments();
@@ -1237,10 +1287,7 @@ app.patch("/admin/users/:id", verifyToken, verifyAdmin, async (req, res) => {
     }
 
     // An admin must not lock themselves out of the admin dashboard.
-    if (
-      req.params.id === req.user._id.toString() &&
-      role !== "admin"
-    ) {
+    if (req.params.id === req.user._id.toString() && role !== "admin") {
       return res
         .status(400)
         .send({ message: "You cannot change your own admin role." });
@@ -1264,10 +1311,7 @@ app.patch("/admin/users/:id", verifyToken, verifyAdmin, async (req, res) => {
     if (!targetUser.subscriptionPlan) update.subscriptionPlan = "free";
   }
 
-  await users.updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $set: update },
-  );
+  await users.updateOne({ _id: new ObjectId(req.params.id) }, { $set: update });
 
   res.send({
     message: "User Updated Successfully",
@@ -1299,45 +1343,55 @@ app.get("/admin/menu-items", verifyToken, verifyAdmin, async (req, res) => {
 });
 
 // admin-কে মেনু আইটেম অনুমোদন বা প্রত্যাখ্যান করতে।
-app.patch("/admin/menu-items/:id", verifyToken, verifyAdmin, async (req, res) => {
-  const { status } = req.body;
+app.patch(
+  "/admin/menu-items/:id",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const { status } = req.body;
 
-  if (!["approved", "rejected"].includes(status)) {
-    return res.status(400).send({ message: "Invalid Status" });
-  }
+    if (!["approved", "rejected"].includes(status)) {
+      return res.status(400).send({ message: "Invalid Status" });
+    }
 
-  if (!ObjectId.isValid(req.params.id)) {
-    return res.status(400).send({ message: "Invalid Menu Item ID" });
-  }
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ message: "Invalid Menu Item ID" });
+    }
 
-  const result = await menuItems.updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $set: { status } },
-  );
+    const result = await menuItems.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { status } },
+    );
 
-  if (result.matchedCount === 0) {
-    return res.status(404).send({ message: "Menu Item Not Found" });
-  }
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: "Menu Item Not Found" });
+    }
 
-  res.send({ message: "Menu Item Status Updated Successfully" });
-});
+    res.send({ message: "Menu Item Status Updated Successfully" });
+  },
+);
 
 // admin-কে কোনো মেনু আইটেম মুছতে।
-app.delete("/admin/menu-items/:id", verifyToken, verifyAdmin, async (req, res) => {
-  if (!ObjectId.isValid(req.params.id)) {
-    return res.status(400).send({ message: "Invalid Menu Item ID" });
-  }
+app.delete(
+  "/admin/menu-items/:id",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ message: "Invalid Menu Item ID" });
+    }
 
-  const result = await menuItems.deleteOne({
-    _id: new ObjectId(req.params.id),
-  });
+    const result = await menuItems.deleteOne({
+      _id: new ObjectId(req.params.id),
+    });
 
-  if (result.deletedCount === 0) {
-    return res.status(404).send({ message: "Menu Item Not Found" });
-  }
+    if (result.deletedCount === 0) {
+      return res.status(404).send({ message: "Menu Item Not Found" });
+    }
 
-  res.send({ message: "Menu Item Deleted Successfully" });
-});
+    res.send({ message: "Menu Item Deleted Successfully" });
+  },
+);
 
 // admin-কে সব লেনদেনের তালিকা vendor তথ্য সহ দেখাতে।
 app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
